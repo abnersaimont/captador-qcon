@@ -1,9 +1,11 @@
 # scrape_qconcursos_brave_marcadores_gui_cdp.py
 # GUI sem barra de título + alça para arrastar; contadores em tempo real; reinjeção pós-filtro
 from pathlib import Path
+import ctypes
 import json, os, re, time, subprocess, queue, socket, sys, shutil, traceback
 from datetime import datetime
 from urllib.parse import urlparse
+from urllib.request import urlopen
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import tkinter as tk
 from tkinter import ttk
@@ -22,6 +24,7 @@ LOGIN_CHECK_SELECTOR = "body[data-is-user-signed-in='true']"
 
 # CDP
 DEVTOOLS_HOST = "127.0.0.1"  # evita ::1
+PREFERRED_DEVTOOLS_PORT = 9222
 
 # >>> INÍCIO: escolha automática de porta livre <<<
 def _pick_free_port(start=9222, end=9230, host=DEVTOOLS_HOST, timeout=0.2):
@@ -34,7 +37,7 @@ def _pick_free_port(start=9222, end=9230, host=DEVTOOLS_HOST, timeout=0.2):
             return port  # conectar falhou: porta livre
     return start  # fallback (pode falhar depois, mas não altera o restante do fluxo)
 
-DEVTOOLS_PORT = _pick_free_port(9222, 9230)
+DEVTOOLS_PORT = PREFERRED_DEVTOOLS_PORT
 DEVTOOLS_URL = f"http://{DEVTOOLS_HOST}:{DEVTOOLS_PORT}"
 # >>> FIM: escolha automática de porta livre <<<
 
@@ -63,6 +66,7 @@ AUTOMATION_USER_DATA_DIR = BASE_DIR / "perfil"
 
 # [AJUSTE #4] Logs de erro apenas quando houver exceção
 LOGS_DIR = BASE_DIR / "logs_erro"
+TEMP_JSON_PATH = BASE_DIR / "questoes.temp.json"
 
 # =============== UTILS (iguais, com pequenas adições) ===============
 def clean(s: str) -> str:
@@ -107,6 +111,83 @@ def save_binary(context, url: str, dest: Path) -> bool:
     except Exception:
         pass
     return False
+
+def save_json_atomic(path: Path, data):
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp_path.replace(path)
+
+def load_partial_capture(path: Path):
+    if not path.exists():
+        return [], set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+        if not isinstance(dados, list):
+            raise ValueError("JSON parcial invalido.")
+        vistos = {str(item.get("QID")).strip() for item in dados if str(item.get("QID") or "").strip()}
+        return dados, vistos
+    except Exception:
+        return [], set()
+
+def persist_partial_capture(path: Path, dados):
+    save_json_atomic(path, dados)
+
+def remove_file_silent(path: Path):
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+def find_img_by_src(root, target_src: str):
+    if not root or not target_src:
+        return None
+    try:
+        for img_el in root.query_selector_all("img"):
+            try:
+                if (img_el.get_attribute("src") or "") == target_src:
+                    return img_el
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+def get_foreground_pid():
+    if os.name != "nt":
+        return None
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value or 0) or None
+    except Exception:
+        return None
+
+def get_automation_browser_pids():
+    if os.name != "nt":
+        return set()
+    try:
+        profile = AUTOMATION_USER_DATA_DIR.resolve().as_posix().replace("'", "''")
+        cmd = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -match '^(brave|chrome)(\\.exe)?$' -and "
+            "$_.CommandLine -like '*--remote-debugging-port=*' -and "
+            f"$_.CommandLine -like '*--user-data-dir={profile}*' }} | "
+            "Select-Object -ExpandProperty ProcessId"
+        )
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return {int(line.strip()) for line in out.splitlines() if line.strip().isdigit()}
+    except Exception:
+        return set()
 
 def serialize_node_with_markers(root_el):
     return root_el.evaluate(r"""
@@ -392,6 +473,13 @@ def _port_is_up(host: str, port: int, timeout: float = 0.3) -> bool:
     except Exception:
         return False
 
+def _cdp_endpoint_ready(host: str, port: int, timeout: float = 1.0) -> bool:
+    try:
+        with urlopen(f"http://{host}:{port}/json/version", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
 def _common_paths(exe_name: str):
     # Windows comuns
     pf = os.environ.get("PROGRAMFILES", r"C:\Program Files")
@@ -436,8 +524,10 @@ def start_external_browser_for_cdp(exe_path: Path, port: int):
     ensure_dir(AUTOMATION_USER_DATA_DIR)
 
     # Porta já está de pé?
-    if _port_is_up(DEVTOOLS_HOST, port):
+    if _cdp_endpoint_ready(DEVTOOLS_HOST, port):
         return
+    if _port_is_up(DEVTOOLS_HOST, port):
+        raise RuntimeError(f"A porta {port} ja esta em uso, mas nao respondeu como CDP valido.")
 
     # Lançar com user-data-dir dedicado
     cmd = [
@@ -453,7 +543,7 @@ def start_external_browser_for_cdp(exe_path: Path, port: int):
     # Aguardar a porta subir
     deadline = time.time() + 20.0
     while time.time() < deadline:
-        if _port_is_up(DEVTOOLS_HOST, port, timeout=0.5):
+        if _cdp_endpoint_ready(DEVTOOLS_HOST, port, timeout=0.5):
             return
         time.sleep(0.25)
     raise RuntimeError(f"Navegador com CDP não subiu na porta {port} em {DEVTOOLS_HOST}.")
@@ -463,22 +553,48 @@ def get_browser_context_page(p):
     Tenta (1) Brave; (2) Chrome — ambos via CDP e perfil dedicado; (3) fallback Chromium do Playwright (perfil dedicado).
     Retorna: (browser_or_none, context, page)
     """
-    exe, which = _find_browser_exe(prefer="brave")
-    if exe:
-        start_external_browser_for_cdp(exe, DEVTOOLS_PORT)
+    if _cdp_endpoint_ready(DEVTOOLS_HOST, DEVTOOLS_PORT):
         browser = p.chromium.connect_over_cdp(DEVTOOLS_URL)
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.pages[0] if context.pages else context.new_page()
         return browser, context, page
 
+    exe, which = _find_browser_exe(prefer="brave")
+    if exe:
+        try:
+            start_external_browser_for_cdp(exe, DEVTOOLS_PORT)
+            browser = p.chromium.connect_over_cdp(DEVTOOLS_URL)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.pages[0] if context.pages else context.new_page()
+            return browser, context, page
+        except Exception:
+            pass
+
     # tenta Chrome explicitamente se não achou Brave
     exe, which = _find_browser_exe(prefer="chrome")
     if exe:
-        start_external_browser_for_cdp(exe, DEVTOOLS_PORT)
-        browser = p.chromium.connect_over_cdp(DEVTOOLS_URL)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = context.pages[0] if context.pages else context.new_page()
-        return browser, context, page
+        try:
+            start_external_browser_for_cdp(exe, DEVTOOLS_PORT)
+            browser = p.chromium.connect_over_cdp(DEVTOOLS_URL)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.pages[0] if context.pages else context.new_page()
+            return browser, context, page
+        except Exception:
+            pass
+
+    fallback_port = _pick_free_port(9223, 9230)
+    fallback_url = f"http://{DEVTOOLS_HOST}:{fallback_port}"
+    for prefer in ("brave", "chrome"):
+        exe, which = _find_browser_exe(prefer=prefer)
+        if exe:
+            try:
+                start_external_browser_for_cdp(exe, fallback_port)
+                browser = p.chromium.connect_over_cdp(fallback_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[0] if context.pages else context.new_page()
+                return browser, context, page
+            except Exception:
+                pass
 
     # Fallback: Chromium do Playwright (perfil persistente)
     ensure_dir(AUTOMATION_USER_DATA_DIR)
@@ -497,8 +613,9 @@ class Painel:
         self.root = tk.Tk()
         self.root.title("")
         self.root.overrideredirect(True)     # remove barra superior
-        self.root.attributes("-topmost", True)
+        self.root.attributes("-topmost", False)
         self.root.resizable(False, False)
+        self._topmost_state = False
 
         frm = ttk.Frame(self.root, padding=8)
         frm.grid(row=0, column=0, sticky="nsew")
@@ -506,7 +623,10 @@ class Painel:
         # ---- ALÇA DE ARRASTAR (grip) ----
         grip = ttk.Frame(frm, height=10)
         grip.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0,6))
+        grip.columnconfigure(0, weight=1)
         grip.configure(cursor="fleur")
+        self.btn_sair = ttk.Button(grip, text="X", width=3, command=lambda: self.actions.put("sair"))
+        self.btn_sair.grid(row=0, column=1, sticky="e")
         self._drag_origin = (0, 0)
         self._win_origin = (0, 0)
         def start_move(e):
@@ -522,10 +642,10 @@ class Painel:
         # ---- Botões ----
         self.btn_filtrar = ttk.Button(frm, text="Selecionar", command=lambda: self.actions.put("filtrar_ok"))
         self.btn_captar   = ttk.Button(frm, text="Captar",   command=lambda: self.actions.put("captar"))
-        self.btn_encerrar = ttk.Button(frm, text="Encerrar", command=lambda: self.actions.put("encerrar"))
+        self.btn_finalizar = ttk.Button(frm, text="Finalizar", command=lambda: self.actions.put("finalizar"))
         self.btn_filtrar.grid(row=1, column=0, padx=4, pady=4, sticky="ew")
         self.btn_captar.grid(row=1, column=1, padx=4, pady=4, sticky="ew")
-        self.btn_encerrar.grid(row=1, column=2, padx=4, pady=4, sticky="ew")
+        self.btn_finalizar.grid(row=1, column=2, padx=4, pady=4, sticky="ew")
 
         ttk.Separator(frm, orient="horizontal").grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6,2))
 
@@ -543,6 +663,10 @@ class Painel:
             self.lbl_tot.configure(font=_base)
         except Exception:
             pass
+        try:
+            self.root.after(60, self.position_bottom_right)
+        except Exception:
+            pass
 
         # ---- separador abaixo dos contadores ----
         ttk.Separator(frm, orient="horizontal").grid(
@@ -551,7 +675,7 @@ class Painel:
 
         # ---- texto da empresa ----
         self.lbl_empresa = ttk.Label(frm, text="Beckm", anchor="e")
-        self.lbl_empresa.grid(row=5, column=0, columnspan=3, sticky="e")
+        self.lbl_empresa.grid(row=6, column=0, columnspan=3, sticky="e")
         try:
             _small = tkfont.nametofont("TkDefaultFont").copy()
             _small.configure(size=5)
@@ -561,17 +685,18 @@ class Painel:
 
         for i in range(3):
             frm.columnconfigure(i, weight=1)
+        self.position_bottom_right()
 
         # posição inicial: canto inferior direito
         try:
             self.root.update_idletasks()
-            w = self.root.winfo_width()
-            h = self.root.winfo_height()
+            w = max(self.root.winfo_reqwidth(), self.root.winfo_width())
+            h = max(self.root.winfo_reqheight(), self.root.winfo_height())
             sw = self.root.winfo_screenwidth()
             sh = self.root.winfo_screenheight()
             x = max(0, sw - w - PANEL_MARGIN_X)
             y = max(0, sh - h - PANEL_MARGIN_Y)
-            self.root.geometry(f"+{x}+{y}")
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
             pass
 
@@ -607,6 +732,29 @@ class Painel:
             self.btn_filtrar.state(["!disabled"])
         else:
             self.btn_filtrar.state(["disabled"])
+
+    def set_topmost(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self._topmost_state:
+            return
+        try:
+            self.root.attributes("-topmost", enabled)
+            self._topmost_state = enabled
+        except Exception:
+            pass
+
+    def position_bottom_right(self):
+        try:
+            self.root.update_idletasks()
+            w = max(self.root.winfo_reqwidth(), self.root.winfo_width())
+            h = max(self.root.winfo_reqheight(), self.root.winfo_height())
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            x = max(0, sw - w - PANEL_MARGIN_X)
+            y = max(0, sh - h - PANEL_MARGIN_Y)
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
 
 # ========= helpers de página =========
 def page_signature(page):
@@ -675,7 +823,7 @@ def revelar_e_capturar_texto_associado(card, context, q_folder, total):
                 saved = save_binary(context, src, dest)
             if not saved:
                 try:
-                    img_el = content_el.query_selector(f"img[src='{src}']")
+                    img_el = find_img_by_src(content_el, src)
                     if img_el:
                         #img_el.scroll_into_view_if_needed()
                         img_el.screenshot(path=dest.as_posix())
@@ -813,23 +961,76 @@ def wait_for_selector_retry(page, selector: str, timeout: int = 20000, retries: 
         raise last_err
 
 # ========= Principal (CDP + perfil de automação ou fallback Chromium) =========
+def build_export_path():
+    downloads = Path(os.path.join(os.path.expanduser("~"), "Downloads"))
+    ensure_dir(downloads)
+    out_path = downloads / "questoes.json"
+    if out_path.exists():
+        i = 2
+        while True:
+            cand = downloads / f"questoes ({i}).json"
+            if not cand.exists():
+                return cand
+            i += 1
+    return out_path
+
+def detect_question_issues(registro):
+    issues = []
+    alternativas = [registro.get(f"Alternativa{letra}", "") for letra in "ABCDE"]
+    if not registro.get("Ano"):
+        issues.append("sem ano")
+    if not registro.get("Banca"):
+        issues.append("sem banca")
+    if not registro.get("Enunciado"):
+        issues.append("sem enunciado")
+    if sum(1 for alt in alternativas if clean(alt)) < 2:
+        issues.append("alternativas insuficientes")
+    if not registro.get("Gabarito"):
+        issues.append("sem gabarito")
+    return issues
+
 def main():
     print(f"Automação Qconcursos")
 
-    dados = []
+    dados, vistos_qid = load_partial_capture(TEMP_JSON_PATH)
     vistos_qid = set()  # set de QIDs já captados
-    total = 0
+    total = len(dados)
+    issues_detected = []
     painel = Painel()
+    if total > 0:
+        painel.update_total(total)
+        for idx, registro in enumerate(dados, start=1):
+            critical_issues = detect_question_issues(registro)
+            if critical_issues:
+                qref = (registro.get("QID") or f"questao_{idx}")
+                issues_detected.append(f"{qref}: {', '.join(critical_issues)}")
+        print(f"ℹ️ Captação parcial recuperada: {total} questão(ões).")
+    vistos_qid = {str(item.get("QID")).strip() for item in dados if str(item.get("QID") or "").strip()}
 
     with sync_playwright() as p:
         # [AJUSTE #0] Detecta Brave/Chrome; se nenhum, usa Chromium do Playwright.
         browser_or_none, context, page = get_browser_context_page(p)
         context.set_default_timeout(4000)
         context.set_default_navigation_timeout(8000)
+        automation_pids = get_automation_browser_pids()
+        last_pid_refresh = 0.0
 
 
         # Atualiza contagem na UI e habilita/desabilita "Captar"
         page.expose_function("pyUpdateSelectionCount", lambda n: painel.update_selected(int(n)))
+        try:
+            page.on("close", lambda *_: painel.actions.put("browser_closed"))
+        except Exception:
+            pass
+        try:
+            context.on("close", lambda *_: painel.actions.put("browser_closed"))
+        except Exception:
+            pass
+        try:
+            if browser_or_none:
+                browser_or_none.on("disconnected", lambda *_: painel.actions.put("browser_closed"))
+        except Exception:
+            pass
 
         page.goto(HOME_URL, wait_until="domcontentloaded")
         normalize_view(page)
@@ -852,6 +1053,18 @@ def main():
         while running:
             painel.loop_once()
             act = painel.get_action_nonblocking()
+            now = time.time()
+            if now - last_pid_refresh > 1.0:
+                refreshed_pids = get_automation_browser_pids()
+                if refreshed_pids:
+                    automation_pids = refreshed_pids
+                last_pid_refresh = now
+            painel.set_topmost(get_foreground_pid() in automation_pids if automation_pids else False)
+
+            if act == "browser_closed":
+                print("ℹ️ A janela da automação foi fechada. Encerrando o app para evitar erros.")
+                running = False
+                break
 
             # Detecta mudança de página/resultado para reabilitar o botão
             current_sig = page_signature(page)
@@ -868,7 +1081,6 @@ def main():
                 last_sig = current_sig
 
             if selecao_pronta:
-                now = time.time()
                 if now - last_poll > 0.2:
                     try:
                         n = page.evaluate("() => document.querySelectorAll('.qc-checkbox:checked').length")
@@ -884,7 +1096,7 @@ def main():
                     # [AJUSTE #5] retry leve
                     wait_for_selector_retry(page, SELECTORS["card"], timeout=8000, retries=2, delay=0.4)
                 except PWTimeoutError:
-                    print("⏳ Nenhum card encontrado; ajuste filtros.")
+                    print("⏳ Nenhum card encontrado; ajuste os filtros. Se isso persistir, o padrão do site pode ter mudado.")
                     selecao_pronta = False
                     painel.set_filtrar_enabled(True)
                     continue
@@ -1001,7 +1213,7 @@ def main():
                         if not saved:
                             try:
                                 if enun_el:
-                                    img_el = enun_el.query_selector(f"img[src='{src}']")
+                                    img_el = find_img_by_src(enun_el, src)
                                     if img_el: img_el.scroll_into_view_if_needed(); img_el.screenshot(path=dest.as_posix()); saved = True
                             except Exception: pass
                         if saved:
@@ -1040,7 +1252,7 @@ def main():
                             if not saved:
                                 try:
                                     if alt_node:
-                                        img_el = alt_node.query_selector(f"img[src='{src}']")
+                                        img_el = find_img_by_src(alt_node, src)
                                         if img_el: img_el.scroll_into_view_if_needed(); img_el.screenshot(path=dest.as_posix()); saved = True
                                 except Exception: pass
                             if saved:
@@ -1084,6 +1296,11 @@ def main():
                     dados.append(registro)
                     total += 1
                     painel.update_total(total)
+                    persist_partial_capture(TEMP_JSON_PATH, dados)
+                    critical_issues = detect_question_issues(registro)
+                    if critical_issues:
+                        qref = qid_real or f"questao_{total}"
+                        issues_detected.append(f"{qref}: {', '.join(critical_issues)}")
                     # ====== FIM DA ALTERAÇÃO ÚNICA ======
 
                 # envia set atualizado para bloquear duplicados ainda visíveis
@@ -1098,7 +1315,39 @@ def main():
                 except Exception: pass
                 painel.update_selected(0)  # limpa seleção (desabilita "Captar")
 
-            elif act == "encerrar":
+            elif act == "finalizar":
+                if total == 0 or not dados:
+                    print("\nℹ️ Nenhuma questão captada nesta sessão — nenhum arquivo foi gerado.")
+                    continue
+
+                out_path = build_export_path()
+                save_json_atomic(out_path, dados)
+                remove_file_silent(TEMP_JSON_PATH)
+
+                print(f"\n✅ Captação finalizada. Questões coletadas: {total}")
+                print(f"🗂️ Exportado: {out_path.as_posix()}")
+                print(f"🖼️ Mídias em: {MEDIA_DIR.resolve().as_posix()}")
+                if issues_detected:
+                    print(f"⚠️ Aviso: {len(issues_detected)} questão(ões) tiveram campos críticos faltando.")
+                    for issue in issues_detected[:10]:
+                        print(f"   - {issue}")
+                    if len(issues_detected) > 10:
+                        print(f"   - ... e mais {len(issues_detected) - 10}")
+
+                dados = []
+                vistos_qid = set()
+                total = 0
+                issues_detected = []
+                selecao_pronta = False
+                painel.update_total(0)
+                painel.update_selected(0)
+                painel.set_filtrar_enabled(True)
+                try:
+                    page.evaluate("() => window.__QC_limparSelecao && window.__QC_limparSelecao()")
+                except Exception:
+                    pass
+                print("ℹ️ Sessão limpa. Você pode iniciar uma nova captação sem fechar o app.")
+                continue
                 # Se nada foi captado, NÃO gera JSON
                 if total == 0 or not dados:
                     print("\nℹ️ Nenhuma questão captada — nenhum arquivo foi gerado.")
@@ -1124,7 +1373,11 @@ def main():
                 running = False
                 break
 
-            time.sleep(0.015)
+            elif act == "sair":
+                running = False
+                break
+
+            time.sleep(0.05)
 
     try: painel.root.destroy()
     except Exception: pass
